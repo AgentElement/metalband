@@ -1,7 +1,8 @@
-import xml.etree.ElementTree as ET
+import lxml.etree as ET
 import argparse
 import gzip
 import sys
+import os  # For checking path for user message
 
 
 def extract_doi_year(element):
@@ -12,70 +13,61 @@ def extract_doi_year(element):
     """
     doi = None
     year_str = None
-    key = element.get("key")  # DBLP key
+    key = element.get("key")
 
-    for child in element:
-        if child.tag == "ee" and child.text and "doi.org/" in child.text.lower():
-            # Extract DOI, try to normalize it
+    ee_tags = element.findall("ee")
+    for ee_tag in ee_tags:
+        if ee_tag.text and "doi.org/" in ee_tag.text.lower():
             try:
-                doi_text = child.text.lower()
+                doi_text = ee_tag.text.lower()
                 doi_start = doi_text.find("doi.org/") + len("doi.org/")
                 doi = doi_text[doi_start:]
-                # Remove potential trailing garbage if any (though less common for DOI itself)
                 if " " in doi:
                     doi = doi.split(" ")[0]
+                break
             except Exception:
-                pass  # Could not parse DOI from ee
-        elif child.tag == "year" and child.text:
-            year_str = child.text.strip()
-            # Basic validation for a 4-digit year
-            if not (len(year_str) == 4 and year_str.isdigit()):
-                year_str = None  # Invalid year format
+                pass
 
-    # As a fallback for DOI, check <note type="doi">
+    year_tag = element.find("year")
+    if year_tag is not None and year_tag.text:
+        year_str = year_tag.text.strip()
+        if not (len(year_str) == 4 and year_str.isdigit()):
+            year_str = None
+
     if not doi:
-        for child in element:
-            if child.tag == "note" and child.get("type") == "doi" and child.text:
+        note_tags = element.findall("note")
+        for note_tag in note_tags:
+            if note_tag.get("type") == "doi" and note_tag.text:
                 try:
-                    doi_text = child.text.lower()
-                    # Assuming the text of the note is the DOI itself
-                    if "doi.org/" in doi_text:  # If it includes the full URL
+                    doi_text = note_tag.text.lower()
+                    if "doi.org/" in doi_text:
                         doi_start = doi_text.find("doi.org/") + len("doi.org/")
                         doi = doi_text[doi_start:]
-                    else:  # Assuming it's just the DOI string
+                    else:
                         doi = doi_text
                     if " " in doi:
                         doi = doi.split(" ")[0]
+                    break
                 except Exception:
                     pass
 
     if doi and year_str:
         return key, doi, year_str
-    return (
-        key,
-        None,
-        None,
-    )  # Return key even if DOI/year is missing for citation resolution
+    return key, None, None
 
 
 def parse_dblp_xml(xml_file_path):
-    """
-    Parses the DBLP XML dump and extracts paper and citation information.
+    print(f"Starting parsing of {xml_file_path} with lxml...")
+    print(
+        f"IMPORTANT: Ensure 'dblp.dtd' is in the same directory as the XML file: '{os.path.dirname(os.path.abspath(xml_file_path))}'"
+    )
+    print(
+        f"Or, if parsing from a stream (like .gz), ensure 'dblp.dtd' is in the current working directory: '{os.getcwd()}' if lxml can't find it relative to the stream's origin."
+    )
 
-    Args:
-        xml_file_path (str): Path to the DBLP XML file (can be .xml or .xml.gz).
-
-    Returns:
-        tuple: (all_papers, citation_links)
-               all_papers: A dictionary mapping (doi, year) to DBLP key.
-               citation_links: A list of tuples, where each tuple is
-                               ((citing_doi, citing_year), (cited_doi, cited_year))
-    """
-    print(f"Starting parsing of {xml_file_path}...")
-
-    all_papers_by_key = {}  # Stores {dblp_key: (doi, year)}
-    all_papers_output = {}  # Stores {(doi, year): dblp_key} for the final output
-    citation_relationships_by_key = []  # Stores (citing_key, cited_key_from_cite_tag)
+    all_papers_by_key = {}
+    all_papers_output = {}
+    citation_relationships_by_key = []
 
     publication_tags = {
         "article",
@@ -88,61 +80,91 @@ def parse_dblp_xml(xml_file_path):
         "www",
     }
 
-    # Determine if the file is gzipped
-    is_gzipped = xml_file_path.endswith(".gz")
-    open_func = gzip.open if is_gzipped else open
-    read_mode = (
-        "rb" if is_gzipped else "r"
-    )  # gzip needs binary, ET needs text for iterparse source
+    # Crucial parser arguments for lxml.etree.iterparse
+    # load_dtd=True:       Instructs the parser to load the DTD. This is essential for resolving entities like ü.
+    # resolve_entities=True: (Default is True) Instructs the parser to replace entity references with their definitions.
+    # no_network=True:     Prevents network access for DTDs/entities (good for local files).
+    iterparse_kwargs = {
+        "load_dtd": True,
+        "resolve_entities": True,  # Default is True, but explicit for clarity
+        "no_network": True,  # Important for security and predictability with local DTDs
+    }
 
-    context = ET.iterparse(xml_file_path, events=("start", "end"))
-    # Get an iterator. In Python 3.8+ we can pass the file object directly to ET.iterparse.
-    # For older versions, you might need to handle file opening and passing `source` carefully.
-    # This example assumes direct path usage which works in recent Python versions.
+    file_obj = None
+    try:
+        is_gzipped = xml_file_path.endswith(".gz")
 
-    _, root = next(context)  # Get root element to clear it later
+        if is_gzipped:
+            file_obj = gzip.open(xml_file_path, "rb")  # Open as binary stream
+            # When parsing from a stream, lxml might not know the original file's path
+            # to resolve the DTD. It might try CWD or rely on libxml2's search paths.
+            # Having dblp.dtd in the CWD can sometimes help in such cases.
+            context = ET.iterparse(
+                file_obj,
+                events=("end",),
+                tag=list(publication_tags) + ["dblp"],
+                **iterparse_kwargs,
+            )
+        else:
+            # When parsing from a filename, lxml can use the file's directory
+            # as the base for resolving the DTD (e.g., "dblp.dtd" in same dir).
+            context = ET.iterparse(
+                xml_file_path,
+                events=("end",),
+                tag=list(publication_tags) + ["dblp"],
+                **iterparse_kwargs,
+            )
 
-    processed_elements = 0
-    relevant_elements = 0
+        processed_elements = 0
+        relevant_elements = 0
 
-    for event, elem in context:
-        if event == "end" and elem.tag in publication_tags:
-            processed_elements += 1
-            if processed_elements % 500000 == 0:
-                print(f"  Processed {processed_elements} top-level elements...")
+        for event, elem in context:
+            if elem.tag in publication_tags:
+                processed_elements += 1
+                if processed_elements % 500000 == 0:
+                    print(f"  Processed {processed_elements} publication elements...")
 
-            key, doi, year = extract_doi_year(elem)
+                key, doi, year = extract_doi_year(elem)
 
-            if key:  # Every publication should have a key
-                if doi and year:
-                    all_papers_by_key[key] = (doi, year)
-                    all_papers_output[(doi, year)] = key
-                    relevant_elements += 1
+                if key:
+                    if doi and year:
+                        all_papers_by_key[key] = (doi, year)
+                        all_papers_output[(doi, year)] = key
+                        relevant_elements += 1
 
-                # Look for <cite> tags (citations made by this paper)
-                # The <cite> tag in DBLP often contains the DBLP key of the cited paper.
-                for child in elem.findall("cite"):
-                    cited_key = child.text
-                    if cited_key:  # cited_key is the DBLP key of the paper being cited
-                        # It might have a label like "... [SomeLabel12] Some Other Text"
-                        # Or just "key_of_cited_paper"
-                        # We assume for now it's mostly just the key or starts with the key
-                        cited_key_cleaned = cited_key.split(" ")[0]  # Basic cleaning
-                        citation_relationships_by_key.append((key, cited_key_cleaned))
+                    for child in elem.findall("cite"):
+                        cited_key = child.text
+                        if cited_key:
+                            cited_key_cleaned = cited_key.split(" ")[0]
+                            citation_relationships_by_key.append(
+                                (key, cited_key_cleaned)
+                            )
 
-            # Efficiently clear the element and its children from memory
             elem.clear()
-            # Also clear the root reference to the element
-            # This is crucial for large XML files to free memory
-            # (From lxml documentation, similar principle applies to ElementTree's iterparse)
-            # For ElementTree, clearing the parent's children list might be more direct if accessible,
-            # but elem.clear() itself helps a lot.
-            # Periodically, clearing children of the root can also help.
-            if processed_elements % 10000 == 0:  # Adjust frequency as needed
-                while (
-                    root and root._children
-                ):  # _children is internal, use with caution or find public API if available
-                    root._children.pop(0)
+            while elem.getprevious() is not None:
+                del elem.getparent()[elem.getparent().index(elem.getprevious())]
+
+    except ET.XMLSyntaxError as e:
+        print(f"lxml.etree.XMLSyntaxError: {e}", file=sys.stderr)
+        print(
+            "This error often means the DTD ('dblp.dtd') was not found or could not be processed, or the XML is malformed.",
+            file=sys.stderr,
+        )
+        print(
+            f"Please ensure 'dblp.dtd' is in the same directory as your XML file ('{os.path.dirname(os.path.abspath(xml_file_path))}') and that both files are valid.",
+            file=sys.stderr,
+        )
+        if file_obj:
+            file_obj.close()
+        sys.exit(1)
+    except Exception as e:
+        print(f"An unexpected error occurred during parsing: {e}", file=sys.stderr)
+        if file_obj:
+            file_obj.close()
+        sys.exit(1)
+    finally:
+        if file_obj:
+            file_obj.close()
 
     print(
         f"\nFinished initial parsing. Found {len(all_papers_by_key)} papers with keys."
@@ -152,44 +174,39 @@ def parse_dblp_xml(xml_file_path):
         f"Found {len(citation_relationships_by_key)} potential citation links (by DBLP key)."
     )
 
-    # Resolve citation_relationships_by_key to DOI-based citation_links
     print("\nResolving citation links to (DOI, Year)...")
     citation_links_output = []
     resolved_citations = 0
     unresolved_citations_citing_missing = 0
     unresolved_citations_cited_missing = 0
+    total_raw_citations = len(citation_relationships_by_key)
 
-    for citing_key, cited_key in citation_relationships_by_key:
+    for i, (citing_key, cited_key) in enumerate(citation_relationships_by_key):
         citing_paper_info = all_papers_by_key.get(citing_key)
         cited_paper_info = all_papers_by_key.get(cited_key)
 
         if citing_paper_info and cited_paper_info:
-            # Both citing and cited papers have (DOI, Year)
             citation_links_output.append((citing_paper_info, cited_paper_info))
             resolved_citations += 1
-        elif not citing_paper_info:
+        elif not citing_paper_info and cited_paper_info:
             unresolved_citations_citing_missing += 1
-        elif not cited_paper_info:
+        elif citing_paper_info and not cited_paper_info:
             unresolved_citations_cited_missing += 1
 
-        if (
-            resolved_citations
-            + unresolved_citations_citing_missing
-            + unresolved_citations_cited_missing
-        ) % 100000 == 0:
+        if (i + 1) % 500000 == 0:
             print(
-                f"  Processed {resolved_citations + unresolved_citations_citing_missing + unresolved_citations_cited_missing}/{len(citation_relationships_by_key)} raw citation links for DOI resolution..."
+                f"  Processed {i + 1}/{total_raw_citations} raw citation links for DOI resolution..."
             )
 
-    print(f"\nFinished resolving citations.")
+    print("\nFinished resolving citations.")
     print(
         f"  Successfully resolved {resolved_citations} citations to (DOI, Year) for both ends."
     )
     print(
-        f"  Citations where citing paper's DOI/Year was missing: {unresolved_citations_citing_missing}"
+        f"  Citations where citing paper's (DOI, Year) was missing from our extracted list: {unresolved_citations_citing_missing}"
     )
     print(
-        f"  Citations where cited paper's DOI/Year was missing (but citing was present): {unresolved_citations_cited_missing}"
+        f"  Citations where cited paper's (DOI, Year) was missing from our extracted list (but citing was present): {unresolved_citations_cited_missing}"
     )
 
     return all_papers_output, citation_links_output
@@ -197,7 +214,7 @@ def parse_dblp_xml(xml_file_path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Parse DBLP XML and extract paper and citation lists by DOI and year."
+        description="Parse DBLP XML with lxml and extract paper and citation lists by DOI and year."
     )
     parser.add_argument(
         "dblp_xml_file",
@@ -221,6 +238,22 @@ def main():
     ):
         print("Error: DBLP file must be an .xml or .xml.gz file.", file=sys.stderr)
         sys.exit(1)
+
+    # Check if DTD is present (basic check)
+    xml_dir = os.path.dirname(os.path.abspath(args.dblp_xml_file))
+    dtd_path = os.path.join(xml_dir, "dblp.dtd")
+    if not os.path.exists(dtd_path):
+        print(
+            f"Warning: 'dblp.dtd' not found at expected location: {dtd_path}",
+            file=sys.stderr,
+        )
+        print(
+            "The DTD is required for resolving XML entities. Parsing might fail or be incorrect.",
+            file=sys.stderr,
+        )
+        # Allow to proceed, parser will error out if DTD is strictly needed by the XML content.
+    else:
+        print(f"Found 'dblp.dtd' at: {dtd_path}")
 
     try:
         all_papers, citation_links = parse_dblp_xml(args.dblp_xml_file)
@@ -248,14 +281,8 @@ def main():
             f"Error: DBLP XML file not found at {args.dblp_xml_file}", file=sys.stderr
         )
         sys.exit(1)
-    except ET.ParseError as e:
-        print(
-            f"Error: Could not parse the XML file. It might be malformed or not a DBLP XML. Details: {e}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
     except Exception as e:
-        print(f"An unexpected error occurred: {e}", file=sys.stderr)
+        print(f"An unexpected error occurred in main: {e}", file=sys.stderr)
         sys.exit(1)
 
 

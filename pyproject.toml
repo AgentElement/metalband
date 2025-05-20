@@ -5,6 +5,7 @@ description = "metalband"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "lxml>=5.4.0",
     "urllib3>=2.2.3",
 ]
 
